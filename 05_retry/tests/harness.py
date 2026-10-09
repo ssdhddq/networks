@@ -27,7 +27,7 @@ def run(args=(), stdin="", timeout=30):
     script = TASK_DIR / "run.sh"
     if not script.exists():
         raise AssertionError(
-            "в каталоге %s нет файла run.sh — создайте его по образцу run.sh.example"
+            "в каталоге %s нет файла run.sh — создайте его по образцу run.sh"
             % TASK_DIR.name)
     _build()
     env = dict(os.environ, PYTHONUNBUFFERED="1")
