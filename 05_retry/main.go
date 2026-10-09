@@ -35,7 +35,7 @@ func parseOptions(args []string) (options, error) {
 		case "--max-attempts":
 			attempts, err := strconv.Atoi(value)
 			if err != nil || attempts < 1 {
-				return options{}, fmt.Errorf("--max-attempts must be a positive integer")
+				return options{}, fmt.Errorf(" max attempts a positive integer")
 			}
 			result.maxAttempts = attempts
 		case "--idempotency-key":
@@ -48,7 +48,7 @@ func parseOptions(args []string) (options, error) {
 
 	parsed, err := url.Parse(result.resource)
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
-		return options{}, fmt.Errorf("resource must be a complete http URL")
+		return options{}, fmt.Errorf("resource a complete http URL")
 	}
 	return result, nil
 }
@@ -83,7 +83,6 @@ func retryAfter(response *http.Response) (time.Duration, bool) {
 	return time.Duration(seconds) * time.Second, true
 }
 
-// nextBackoff returns the upper bound for the delay before attempt number n.
 func nextBackoff(n int) time.Duration {
 	milliseconds := 200
 	for attempt := 1; attempt < n; attempt++ {
@@ -109,7 +108,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// request.Close below prevents reusing a connection between attempts.
 	client := &http.Client{Timeout: 5 * time.Second}
 	random := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -125,12 +123,17 @@ func main() {
 		}
 
 		response, requestError := client.Do(request)
+
+		var retryPause time.Duration
+		hasRetryAfter := false
+
 		if requestError == nil {
-			// A broken response body is also a connection error, even if its
-			// status line arrived successfully.
+			retryPause, hasRetryAfter = retryAfter(response)
+
 			_, requestError = io.Copy(io.Discard, response.Body)
 			response.Body.Close()
 		}
+
 		if requestError != nil {
 			fmt.Printf("attempt %d error %s\n", attempt, cleanError(requestError))
 			if attempt == opts.maxAttempts || (!isIdempotent(opts.method) && opts.idempotencyKey == "") {
@@ -158,9 +161,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		if pause, exists := retryAfter(response); exists {
-			fmt.Printf("sleep_ms %d\n", pause.Milliseconds())
-			time.Sleep(pause)
+		if hasRetryAfter {
+			fmt.Printf("sleep_ms %d\n", retryPause.Milliseconds())
+			time.Sleep(retryPause)
 			continue
 		}
 		pause := time.Duration(random.Int63n(int64(nextBackoff(attempt+1)) + 1))
