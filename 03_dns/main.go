@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -194,6 +195,16 @@ func decodeTXT(data []byte) (string, error) {
 	return value.String(), nil
 }
 
+func formatAAAA(data []byte) string {
+	ip := net.IP(data)
+
+	if ip.To4() != nil {
+		return fmt.Sprintf("::ffff:%x:%x", u16(data[12:14]), u16(data[14:16]))
+	}
+
+	return ip.String()
+}
+
 func decodeRecord(message []byte, offset int) (answer, uint32, int, error) {
 	_, next, err := readName(message, offset)
 	if err != nil {
@@ -205,6 +216,9 @@ func decodeRecord(message []byte, offset int) (answer, uint32, int, error) {
 
 	recordType := u16(message[next : next+2])
 	ttl := u32(message[next+4 : next+8])
+	if ttl&0x80000000 != 0 {
+		ttl = 0
+	}
 	rdLength := int(u16(message[next+8 : next+10]))
 	rdataStart := next + 10
 	rdataEnd := rdataStart + rdLength
@@ -225,11 +239,15 @@ func decodeRecord(message []byte, offset int) (answer, uint32, int, error) {
 			return answer{}, 0, 0, errors.New("AAAA record has an invalid length")
 		}
 		result.typeName = "AAAA"
-		result.value = net.IP(message[rdataStart:rdataEnd]).String()
+		result.value = formatAAAA(message[rdataStart:rdataEnd])
 	case typeCNAME, typeNS:
-		name, _, err := readName(message, rdataStart)
+		name, nameEnd, err := readName(message, rdataStart)
 		if err != nil {
 			return answer{}, 0, 0, err
+		}
+
+		if nameEnd != rdataEnd {
+			return answer{}, 0, 0, errors.New("DNS name length does not match RDLENGTH")
 		}
 		result.typeName = typeNames[recordType]
 		result.value = name
@@ -308,6 +326,13 @@ func cacheKey(name, typeName string) string {
 	return strings.ToLower(strings.TrimSuffix(name, ".")) + "\x00" + strings.ToUpper(typeName)
 }
 
+func isTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
 func exchange(conn *net.UDPConn, name string, qtype, id uint16) (response, bool, error) {
 	query, err := buildQuery(id, qtype, name)
 	if err != nil {
@@ -325,17 +350,17 @@ func exchange(conn *net.UDPConn, name string, qtype, id uint16) (response, bool,
 	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if isTimeout(err) {
 				return response{}, true, nil
 			}
 			return response{}, false, err
 		}
-		if n >= 2 && u16(buffer[:2]) != id {
+		if n < 2 || u16(buffer[:2]) != id {
 			continue
 		}
 		parsed, err := parseResponse(buffer[:n], id)
 		if err != nil {
-			return response{}, false, err
+			continue
 		}
 		return parsed, false, nil
 	}
@@ -348,6 +373,7 @@ func printBlock(out *bufio.Writer, queryName, queryType, status string, answers 
 		fmt.Fprintf(out, "answer %s %s %d\n", record.typeName, record.value, record.ttl)
 	}
 	fmt.Fprintln(out, "end")
+	out.Flush()
 }
 
 func main() {
@@ -374,7 +400,6 @@ func main() {
 	defer conn.Close()
 
 	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
 	cache := make(map[string]cacheEntry)
 	var nextID uint16 = 1
 	scanner := bufio.NewScanner(os.Stdin)
