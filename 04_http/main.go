@@ -12,7 +12,6 @@ import (
 type header struct {
 	name  string
 	value string
-
 }
 
 type message struct {
@@ -23,6 +22,13 @@ type message struct {
 	reason    string
 	headers   []header
 	body      []byte
+}
+
+type headerInfo struct {
+	headers          []header
+	contentLength    uint64
+	hasContentLength bool
+	chunked          bool
 }
 
 func isTokenByte(b byte) bool {
@@ -55,56 +61,76 @@ func parseStartLine(line []byte) (message, string) {
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] != "HTTP/1.1" {
 		return message{}, "bad_start_line"
 	}
+	for i := 0; i < len(parts[0]); i++ {
+		if !isTokenByte(parts[0][i]) {
+			return message{}, "bad_start_line"
+		}
+	}
 	return message{isRequest: true, method: parts[0], target: parts[1]}, ""
 }
 
-func parseHeaders(data []byte) ([]header, uint64, bool, bool, string) {
+func parseHeaders(data []byte) (headerInfo, string) {
 	if len(data) == 0 {
-		return nil, 0, false, false, ""
+		return headerInfo{}, ""
 	}
 
-	var headers []header
-	var contentLength uint64
-	hasContentLength := false
-	chunked := false
+	var result headerInfo
 	for _, line := range bytes.Split(data, []byte("\r\n")) {
 		colon := bytes.IndexByte(line, ':')
 		if colon <= 0 {
-			return nil, 0, false, false, "bad_header"
+			return headerInfo{}, "bad_header"
 		}
+
 		nameBytes := line[:colon]
 		for _, character := range nameBytes {
 			if !isTokenByte(character) {
-				return nil, 0, false, false, "bad_header"
+				return headerInfo{}, "bad_header"
+			}
+		}
+
+		valueBytes := line[colon+1:]
+		for _, character := range valueBytes {
+			if (character < 0x20 && character != '\t') || character == 0x7f {
+				return headerInfo{}, "bad_header"
 			}
 		}
 
 		name := strings.ToLower(string(nameBytes))
-		value := strings.Trim(string(line[colon+1:]), " \t")
-		headers = append(headers, header{name: name, value: value})
+		value := strings.Trim(string(valueBytes), " \t")
+		result.headers = append(result.headers, header{name: name, value: value})
+
 		switch name {
 		case "content-length":
 			if value == "" {
-				return nil, 0, false, false, "bad_header"
+				return headerInfo{}, "bad_header"
 			}
 			for _, character := range value {
 				if character < '0' || character > '9' {
-					return nil, 0, false, false, "bad_header"
+					return headerInfo{}, "bad_header"
 				}
 			}
+
 			parsed, err := strconv.ParseUint(value, 10, 64)
 			if err != nil {
-				return nil, 0, false, false, "bad_header"
+				return headerInfo{}, "bad_header"
 			}
-			contentLength = parsed
-			hasContentLength = true
+			if result.hasContentLength && result.contentLength != parsed {
+				return headerInfo{}, "bad_header"
+			}
+
+			result.contentLength = parsed
+			result.hasContentLength = true
+
 		case "transfer-encoding":
-			if strings.EqualFold(value, "chunked") {
-				chunked = true
+			for _, coding := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(coding), "chunked") {
+					result.chunked = true
+				}
 			}
 		}
 	}
-	return headers, contentLength, hasContentLength, chunked, ""
+
+	return result, ""
 }
 
 func parseChunked(data []byte) ([]byte, string) {
@@ -120,6 +146,8 @@ func parseChunked(data []byte) ([]byte, string) {
 		if extension := strings.IndexByte(sizeText, ';'); extension >= 0 {
 			sizeText = sizeText[:extension]
 		}
+		sizeText = strings.TrimSpace(sizeText)
+
 		if sizeText == "" {
 			return nil, "bad_chunk"
 		}
@@ -186,16 +214,15 @@ func parse(data []byte) (message, string) {
 		bodyStart = headersEnd + 4
 	}
 
-	headers, contentLength, hasContentLength, chunked, problem :=
-		parseHeaders(data[headersStart:headersEnd])
+	parsedHeaders, problem := parseHeaders(data[headersStart:headersEnd])
 	if problem != "" {
 		return message{}, problem
 	}
-	result.headers = headers
+	result.headers = parsedHeaders.headers
 
 	bodyData := data[bodyStart:]
 
-	if chunked {
+	if parsedHeaders.chunked {
 		body, problem := parseChunked(bodyData)
 		if problem != "" {
 
@@ -204,12 +231,11 @@ func parse(data []byte) (message, string) {
 		result.body = body
 		return result, ""
 	}
-	if hasContentLength {
-
-		if contentLength > uint64(len(bodyData)) {
+	if parsedHeaders.hasContentLength {
+		if parsedHeaders.contentLength > uint64(len(bodyData)) {
 			return message{}, "incomplete_body"
 		}
-		result.body = bodyData[:int(contentLength)]
+		result.body = bodyData[:int(parsedHeaders.contentLength)]
 	}
 	return result, ""
 }
