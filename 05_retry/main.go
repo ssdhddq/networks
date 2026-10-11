@@ -75,26 +75,52 @@ func successfulStatus(status int) bool {
 	return status >= 200 && status <= 399
 }
 
-func retryAfter(response *http.Response) (time.Duration, bool) {
-	seconds, err := strconv.ParseInt(strings.TrimSpace(response.Header.Get("Retry-After")), 10, 64)
+func canRetry(opts options, attempt int, retryable bool) bool {
+	if attempt >= opts.maxAttempts || !retryable {
+		return false
+	}
+
+	return isIdempotent(opts.method) || opts.idempotencyKey != ""
+}
+
+func retryAfterMilliseconds(response *http.Response) (int64, bool) {
+	seconds, err := strconv.ParseInt(
+		strings.TrimSpace(response.Header.Get("Retry-After")),
+		10,
+		64,
+	)
 	if err != nil || seconds < 0 {
 		return 0, false
 	}
-	return time.Duration(seconds) * time.Second, true
+
+	const maxRetryAfterSeconds = int64((1<<63 - 1) / int64(time.Second))
+	if seconds > maxRetryAfterSeconds {
+		return 0, false
+	}
+
+	return seconds * 1000, true
 }
 
-func nextBackoff(n int) time.Duration {
-	milliseconds := 200
-	for attempt := 1; attempt < n; attempt++ {
-		if milliseconds >= 2000 {
-			return 2000 * time.Millisecond
-		}
-		milliseconds *= 2
-		if milliseconds > 2000 {
-			milliseconds = 2000
+func backoffLimitMilliseconds(nextAttempt int) int64 {
+	if nextAttempt >= 5 {
+		return 2000
+	}
+	return int64(200 << (nextAttempt - 1))
+}
+
+func pauseMilliseconds(response *http.Response, nextAttempt int) int64 {
+	if response != nil {
+		if milliseconds, ok := retryAfterMilliseconds(response); ok {
+			return milliseconds
 		}
 	}
-	return time.Duration(milliseconds) * time.Millisecond
+
+	return rand.Int63n(backoffLimitMilliseconds(nextAttempt) + 1)
+}
+
+func printAndSleep(milliseconds int64) {
+	fmt.Printf("sleep_ms %d\n", milliseconds)
+	time.Sleep(time.Duration(milliseconds) * time.Millisecond)
 }
 
 func cleanError(err error) string {
@@ -108,8 +134,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	random := rand.New(rand.NewSource(time.Now().UnixNano()))
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(request *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	for attempt := 1; attempt <= opts.maxAttempts; attempt++ {
 		request, err := http.NewRequest(opts.method, opts.resource, nil)
@@ -124,25 +154,20 @@ func main() {
 
 		response, requestError := client.Do(request)
 
-		var retryPause time.Duration
-		hasRetryAfter := false
-
 		if requestError == nil {
-			retryPause, hasRetryAfter = retryAfter(response)
-
 			_, requestError = io.Copy(io.Discard, response.Body)
 			response.Body.Close()
 		}
 
 		if requestError != nil {
 			fmt.Printf("attempt %d error %s\n", attempt, cleanError(requestError))
-			if attempt == opts.maxAttempts || (!isIdempotent(opts.method) && opts.idempotencyKey == "") {
+			if !canRetry(opts, attempt, true) {
 				fmt.Printf("result failure attempts %d\n", attempt)
 				os.Exit(1)
 			}
-			pause := time.Duration(random.Int63n(int64(nextBackoff(attempt+1)) + 1))
-			fmt.Printf("sleep_ms %d\n", pause.Milliseconds())
-			time.Sleep(pause)
+
+			milliseconds := pauseMilliseconds(nil, attempt+1)
+			printAndSleep(milliseconds)
 			continue
 		}
 
@@ -152,22 +177,12 @@ func main() {
 			fmt.Printf("result success attempts %d\n", attempt)
 			return
 		}
-		canRetry := retryableStatus(response.StatusCode) && attempt < opts.maxAttempts
-		if !isIdempotent(opts.method) && opts.idempotencyKey == "" {
-			canRetry = false
-		}
-		if !canRetry {
+		if !canRetry(opts, attempt, retryableStatus(response.StatusCode)) {
 			fmt.Printf("result failure attempts %d\n", attempt)
 			os.Exit(1)
 		}
 
-		if hasRetryAfter {
-			fmt.Printf("sleep_ms %d\n", retryPause.Milliseconds())
-			time.Sleep(retryPause)
-			continue
-		}
-		pause := time.Duration(random.Int63n(int64(nextBackoff(attempt+1)) + 1))
-		fmt.Printf("sleep_ms %d\n", pause.Milliseconds())
-		time.Sleep(pause)
+		milliseconds := pauseMilliseconds(response, attempt+1)
+		printAndSleep(milliseconds)
 	}
 }
