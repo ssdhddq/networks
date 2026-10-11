@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -16,31 +16,25 @@ func decodeHexDump(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 
-	var hex strings.Builder
-	for _, ch := range string(data) {
-		switch {
-		case ch >= '0' && ch <= '9', ch >= 'a' && ch <= 'f', ch >= 'A' && ch <= 'F':
-			hex.WriteRune(ch)
-		case ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ':':
+	var digits strings.Builder
+	for _, ch := range data {
+		switch ch {
+		case ' ', '\n', '\r', '\t', ':':
 		default:
-			return nil, fmt.Errorf("invalid ch %q", ch)
+			digits.WriteByte(ch)
 		}
 	}
 
-	if hex.Len() == 0 {
+	if digits.Len() == 0 {
 		return nil, errors.New("empty hex dump")
 	}
-	if hex.Len()%2 != 0 {
+	if digits.Len()%2 != 0 {
 		return nil, errors.New("hex dump %2")
 	}
 
-	result := make([]byte, hex.Len()/2)
-	for i := range result {
-		value, err := strconv.ParseUint(hex.String()[2*i:2*i+2], 16, 8)
-		if err != nil {
-			return nil, err
-		}
-		result[i] = byte(value)
+	result, err := hex.DecodeString(digits.String())
+	if err != nil {
+		return nil, fmt.Errorf("invalid hex dump: %w", err)
 	}
 	return result, nil
 }
@@ -105,13 +99,14 @@ func parse(frame []byte, out *bufio.Writer) error {
 	}
 
 	totalLength := int(u16(ip[2:4]))
-	ip = ip[:totalLength]
+
 	if totalLength < ihl {
 		return errors.New("IPv4 total shorter header")
 	}
 	if len(ip) < totalLength {
 		return errors.New("IPv4 packet is truncated")
 	}
+	ip = ip[:totalLength]
 
 	flagsAndOffset := u16(ip[6:8])
 	flags := make([]string, 0, 2)
@@ -186,6 +181,13 @@ func parse(frame []byte, out *bufio.Writer) error {
 			return errors.New("UDP header is truncated")
 		}
 		udpLength := int(u16(payload[4:6]))
+
+		if udpLength < 8 {
+			return errors.New("UDP length < 8")
+		}
+		if udpLength != len(payload) {
+			return errors.New("UDP length not match IPv4 length")
+		}
 		emit(out, "udp.src_port", u16(payload[0:2]))
 		emit(out, "udp.dst_port", u16(payload[2:4]))
 		emit(out, "udp.length", udpLength)
